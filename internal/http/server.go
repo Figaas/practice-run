@@ -56,8 +56,9 @@ func (s *Server) serveWs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name, clientID := extractClientDetails(r)
-	loopBreaker, stop := setupLoopBreaker()
 	s.handleNewClientConnection(conn, clientID, name)
+
+	loopBreaker, stop := setupLoopBreaker()
 	s.handleDisconnectedClient(conn, clientID, stop)
 
 	for {
@@ -125,10 +126,10 @@ func (s *Server) handleMessages(conn *websocket.Conn, clientID string, stop func
 	case "send_message":
 		s.handleSendMessage(ctx, raw, clientID)
 	default:
-		// IMPROVEMENT: DisconnectClient should receive some custom type like DisconnectReason
+		// IMPROVEMENT: DisconnectClient should receive custom type with DisconnectReason
 		_ = conn.WriteControl(
 			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseProtocolError, ""),
+			websocket.FormatCloseMessage(websocket.CloseProtocolError, "invalid message type"),
 			time.Now().Add(time.Second),
 		)
 

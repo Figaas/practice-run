@@ -10,3 +10,7 @@ func main() {
 	srv := http.NewServer(chat)
 	srv.Run()
 }
+
+// IMPROVEMENT: implement graceful shutdown
+// IMPROVEMENT: for better performance we could introduce protobuf messages format (perhaps with gRPC) for internal communication
+// IMPROVEMENT: for a production use the app should support retrieving state from some stateful service
