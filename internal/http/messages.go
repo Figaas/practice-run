@@ -1,7 +1,11 @@
 package http
 
+// IMPROVEMENT: documentation for external usage for ex. with asyncAPI
+
 type base struct {
-	Type string `json:"type"`
+	// IMPROVEMENT: define messageType type and variables and use them instead raw strings
+	Type      string `json:"type"`
+	MessageID int64  `json:"message_id"`
 }
 
 type joinRoom struct {
@@ -18,6 +22,14 @@ type sendMessage struct {
 	Content string `json:"content"`
 }
 
+type messageReceived struct {
+	base
+	RoomID   string `json:"room_id"`
+	From     string `json:"from"`
+	FromName string `json:"from_name"`
+	Msg      string `json:"msg"`
+}
+
 type createNewRoom struct {
 	base
 	Name string `json:"name"`
@@ -32,7 +44,20 @@ type newRoomCreated struct {
 	room
 }
 
-type roomsUpdate struct {
+type hello struct {
 	base
 	Rooms []room `json:"rooms"`
 }
+
+type errorMessage struct {
+	base
+	Error string `json:"error"`
+}
+
+func (m errorMessage) IsMessage() {}
+
+type okMessage struct {
+	base
+}
+
+func (m okMessage) IsMessage() {}

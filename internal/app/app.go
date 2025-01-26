@@ -1,15 +1,21 @@
 package app
 
 import (
-	"fmt"
+	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/segmentio/ksuid"
+
+	"practice-run/internal/message"
+	"practice-run/internal/ports"
 )
+
+var _ ports.App = (*App)(nil)
 
 type App struct {
 	rooms   map[string]*Room
-	clients map[string]*client
+	clients clients
 
 	clientsMutex sync.RWMutex
 	roomsMutex   sync.RWMutex
@@ -23,30 +29,47 @@ func NewApp() *App {
 	}
 }
 
-func (a *App) ConnectNewClient(id, name string, ch MessageChannel) {
-	fmt.Println("Connect client: ", id)
-	a.clientsMutex.Lock()
-	defer a.clientsMutex.Unlock()
+// IMPROVEMENT: clientID and roomID should be custom types
 
-	a.clients[id] = newClient(id, name, ch)
+func (a *App) ConnectNewClient(_ context.Context, id, name string, ch ports.MessageChannel) {
+	slog.Debug("Connect client", "client_id", id)
+	a.clientsMutex.Lock()
+	c := newClient(id, name, ch)
+	a.clients[id] = c
+	a.clientsMutex.Unlock()
+
+	a.roomsMutex.RLock()
+	defer a.roomsMutex.RUnlock()
+
+	i := 0
+	msg := message.HelloMessage{
+		Rooms: make([]message.Room, len(a.rooms)),
+	}
+	for _, v := range a.rooms {
+		msg.Rooms[i] = message.Room{Name: v.Name, ID: v.ID}
+		i++
+	}
+
+	c.sendMessage(msg)
 }
 
-func (a *App) DisconnectClient(id string) {
-	fmt.Println("Disconnect client: ", id)
+func (a *App) DisconnectClient(_ context.Context, id string) {
+	slog.Debug("Disconnect client: ", id)
+
 	a.clientsMutex.Lock()
 	defer a.clientsMutex.Unlock()
 
-	// TODO leave rooms
-
+	c := a.clients[id]
+	c.leaveRooms()
 	delete(a.clients, id)
+	c.close()
 }
 
-func (a *App) CreateNewRoom(name string) {
-	fmt.Println("CreateNewRoom")
-	_ = a.createNewRoom(name)
+func (a *App) CreateNewRoom(ctx context.Context, name string, clientID string) {
+	slog.Debug("CreateNewRoom")
+	id := a.createNewRoom(name)
 
-	// TODO
-	//a.broadcastNewRoom(id, name)
+	a.broadcastNewRoom(ctx, id, name, clientID)
 }
 
 func (a *App) createNewRoom(name string) string {
@@ -59,59 +82,94 @@ func (a *App) createNewRoom(name string) string {
 	return id
 }
 
-func (a *App) broadcastNewRoom(id string, name string) {
-	a.roomsMutex.RLock()
-	defer a.roomsMutex.RUnlock()
-
-	// TODO
-}
-
-func (a *App) JoinRoom(clientID string, roomID string) {
-	fmt.Println("JoinRoom")
-
+func (a *App) broadcastNewRoom(ctx context.Context, id string, name string, clientID string) {
 	a.clientsMutex.RLock()
-	defer a.roomsMutex.RUnlock()
+	defer a.clientsMutex.RUnlock()
 
-	a.roomsMutex.RLock()
-	defer a.roomsMutex.RUnlock()
-
-	client := a.clients[clientID]
-	room := a.rooms[roomID]
-
-	client.joinRoom(room)
-	room.addClient(client)
-}
-
-func (a *App) LeaveRoom(clientID string, roomID string) error {
-	fmt.Println("LeaveRoom")
-
-	a.clientsMutex.RLock()
-	defer a.roomsMutex.RUnlock()
-
-	a.roomsMutex.RLock()
-	defer a.roomsMutex.RUnlock()
-
-	client := a.clients[clientID]
-	a.rooms[roomID].deleteClient(clientID)
-
-	client.leaveRoom(roomID)
-
-	return nil
-}
-
-func (a *App) ListRooms() []Room {
-	a.roomsMutex.RLock()
-	defer a.roomsMutex.RUnlock()
-
-	ret, i := make([]Room, 0, len(a.rooms)), 0
-	for _, v := range a.rooms {
-		ret[i] = *v
-		i++
+	msg := message.NewRoomMessage{
+		Room: message.Room{
+			ID:   id,
+			Name: name,
+		},
 	}
 
-	return ret
+	a.clients[clientID].respondOK(ctx)
+	a.clients.sendMessage(msg)
 }
 
-func (a *App) SendMessageToRoom(string, string, string) {
-	fmt.Println("SendMessageToRoom")
+func (a *App) JoinRoom(ctx context.Context, clientID string, roomID string) {
+	slog.Debug("JoinRoom")
+
+	a.clientsMutex.RLock()
+	defer a.clientsMutex.RUnlock()
+
+	a.roomsMutex.RLock()
+	defer a.roomsMutex.RUnlock()
+
+	c := a.clients[clientID]
+	room, ok := a.rooms[roomID]
+	if !ok {
+		c.respondError(ctx)(ports.ErrRoomNotFound)
+		return
+	}
+
+	room.addClient(c)
+	c.joinRoom(
+		room,
+		c.respondOK(ctx),
+	)
+}
+
+func (a *App) LeaveRoom(ctx context.Context, clientID string, roomID string) {
+	slog.Debug("LeaveRoom")
+
+	a.clientsMutex.RLock()
+	defer a.clientsMutex.RUnlock()
+
+	a.roomsMutex.RLock()
+	defer a.roomsMutex.RUnlock()
+
+	c := a.clients[clientID]
+	r, ok := a.rooms[roomID]
+	if !ok {
+		c.respondError(ctx)(ports.ErrRoomNotFound)
+		return
+	}
+
+	r.deleteClient(clientID)
+	c.leaveRoom(
+		roomID,
+		c.respondOK(ctx),
+		c.respondError(ctx),
+	)
+}
+
+func (a *App) SendMessageToRoom(ctx context.Context, clientID string, roomID string, content string) {
+	slog.Debug("SendMessageToRoom")
+
+	a.clientsMutex.RLock()
+	defer a.clientsMutex.RUnlock()
+
+	a.roomsMutex.RLock()
+	defer a.roomsMutex.RUnlock()
+
+	c := a.clients[clientID]
+	r, ok := a.rooms[roomID]
+	if !ok {
+		c.respondError(ctx)(ports.ErrRoomNotFound)
+	}
+
+	msg := message.TextMessage{
+		RoomID:         roomID,
+		FromClientID:   clientID,
+		FromClientName: c.name,
+		Message:        content,
+	}
+
+	r.broadcastClientMessage(
+		clientID,
+		msg,
+		c.respondOK(ctx),
+		c.respondError(ctx),
+	)
 }

@@ -1,31 +1,41 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/icrowley/fake"
+	"github.com/segmentio/ksuid"
+
+	"practice-run/internal/ports"
 )
 
+// IMPROVEMENT: upgrader could be configurable with some config file
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin:     checkOrigin,
 }
 
 type Server struct {
-	app App
+	app ports.App
 }
 
-func NewServer(app App) *Server {
+func NewServer(app ports.App) *Server {
 	return &Server{app: app}
 }
 
 func (s *Server) Run() {
-	// TODO use custom server
+	// IMPROVEMENT: server could be configurable with some config file
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		s.serveWs(w, r)
 	})
@@ -45,48 +55,47 @@ func (s *Server) serveWs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// IMPROVEMENTS: client ID and name should be returned during authentication and extracted for request metadata
-	name := r.Header.Get("name")
-	clientID := r.Header.Get("client_id")
+	name, clientID := extractClientDetails(r)
+	loopBreaker, stop := setupLoopBreaker()
 	s.handleNewClientConnection(conn, clientID, name)
-	disconnectChan := s.handleDisconnectClient(conn, clientID)
+	s.handleDisconnectedClient(conn, clientID, stop)
 
 	for {
 		select {
-		case <-disconnectChan:
+		case <-loopBreaker:
 			return
 		default:
-			s.handleMessages(conn, clientID)
+			s.handleMessages(conn, clientID, stop)
 		}
 	}
 }
 
-func (s *Server) handleNewClientConnection(conn *websocket.Conn, id, name string) {
-	s.app.ConnectNewClient(id, name, newWebSocketClient(conn))
-	rooms := s.app.ListRooms()
-
-	msg := roomsUpdate{
-		base:  base{Type: "rooms_update"},
-		Rooms: make([]room, len(rooms)),
-	}
-
-	for i, r := range rooms {
-		msg.Rooms[i] = room{Name: r.Name, ID: r.ID}
-	}
-
-	bs, err := json.Marshal(msg)
-	if err != nil {
-		slog.Error("failed to marshal hello message", "error_msg", err)
-	}
-
-	err = conn.WriteMessage(websocket.TextMessage, bs)
-	if err != nil && !errors.Is(err, websocket.ErrCloseSent) {
-		slog.Error("failed to send hello message", "error_msg", err)
-	}
+func setupLoopBreaker() (chan struct{}, func()) {
+	loopBreaker := make(chan struct{})
+	stop := func() { loopBreaker <- struct{}{} }
+	return loopBreaker, stop
 }
 
-func (s *Server) handleMessages(conn *websocket.Conn, clientID string) {
+func extractClientDetails(r *http.Request) (string, string) {
+	// IMPROVEMENTS: client ID and name should be returned during authentication and extracted from request metadata
+	name := r.Header.Get("name")
+	clientID := r.Header.Get("client_id")
+	if name == "" {
+		name = fake.FullName()
+	}
+
+	if clientID == "" {
+		clientID = ksuid.New().String()
+	}
+	return name, clientID
+}
+
+func (s *Server) handleMessages(conn *websocket.Conn, clientID string, stop func()) {
 	messageType, raw, err := conn.ReadMessage()
+	if errors.Is(err, net.ErrClosed) {
+		stop()
+		return
+	}
 	if err != nil {
 		slog.Error("failed to read message", "error_msg", err)
 		return
@@ -105,72 +114,40 @@ func (s *Server) handleMessages(conn *websocket.Conn, clientID string) {
 
 	}
 
+	ctx := context.WithValue(context.Background(), messageIDKey{}, b.MessageID)
 	switch b.Type {
 	case "join_room":
-		s.handleJoinRoom(raw, clientID)
+		s.handleJoinRoom(ctx, raw, clientID)
 	case "leave_room":
-		s.handleLeaveRoom(raw, clientID)
+		s.handleLeaveRoom(ctx, raw, clientID)
 	case "create_new_room":
-		s.handleCreateNewRoom(raw)
+		s.handleCreateNewRoom(ctx, raw)
 	case "send_message":
-		s.handleSendMessage(raw, clientID)
-	}
+		s.handleSendMessage(ctx, raw, clientID)
+	default:
+		// IMPROVEMENT: DisconnectClient should receive some custom type like DisconnectReason
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseProtocolError, ""),
+			time.Now().Add(time.Second),
+		)
 
-	resMessage := fmt.Sprintf("created room with name %s", string(raw))
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(resMessage)); err != nil {
-		log.Println(err)
-		return
+		s.app.DisconnectClient(context.Background(), clientID)
 	}
 
 	return
 }
 
-func (s *Server) handleDisconnectClient(conn *websocket.Conn, clientID string) <-chan struct{} {
-	ch := make(chan struct{})
-	conn.SetCloseHandler(func(code int, text string) error {
-		s.app.DisconnectClient(clientID)
-
-		ch <- struct{}{}
-		return nil
-	})
-
-	return ch
-}
-
-func (s *Server) handleJoinRoom(raw []byte, clientID string) {
-	msg := &joinRoom{}
-	if err := json.Unmarshal(raw, msg); err != nil {
-		slog.Error("failed to unmarshal join room message", "error_msg", err)
+func checkOrigin(r *http.Request) bool {
+	origin := r.Header["Origin"]
+	if len(origin) == 0 {
+		return true
 	}
-
-	// TODO handle error
-	s.app.JoinRoom(clientID, msg.RoomID)
-}
-
-func (s *Server) handleLeaveRoom(raw []byte, clientID string) {
-	msg := &leaveRoom{}
-	if err := json.Unmarshal(raw, msg); err != nil {
-		slog.Error("failed to unmarshal join room message", "error_msg", err)
+	u, err := url.Parse(origin[0])
+	if err != nil {
+		return false
 	}
-
-	// TODO handle error
-	_ = s.app.LeaveRoom(clientID, msg.RoomID)
-}
-
-func (s *Server) handleCreateNewRoom(raw []byte) {
-	msg := &createNewRoom{}
-	if err := json.Unmarshal(raw, msg); err != nil {
-		slog.Error("failed to unmarshal join room message", "error_msg", err)
-	}
-
-	s.app.CreateNewRoom(msg.Name)
-}
-
-func (s *Server) handleSendMessage(raw []byte, clientID string) {
-	msg := &sendMessage{}
-	if err := json.Unmarshal(raw, msg); err != nil {
-		slog.Error("failed to unmarshal join room message", "error_msg", err)
-	}
-
-	s.app.SendMessageToRoom(clientID, msg.RoomID, msg.Content)
+	return strings.EqualFold(u.Host, r.Host) ||
+		strings.EqualFold(u.Host, "websocketking.com") ||
+		strings.EqualFold(u.Host, "localhost:8080")
 }
